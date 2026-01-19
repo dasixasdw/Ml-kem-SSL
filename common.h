@@ -40,8 +40,8 @@
 #define INVALID_SOCKET    -1                      // Invalid socket value definition on Linux Linux平台的无效套接字值定义
 #define IS_INVALID_FD(fd) (fd == -1)              // Judge invalid socket on Linux           Linux平台的无效套接字判断条件
 #define SOCKET_REUSE_FLAG (SO_REUSEADDR | SO_REUSEPORT)  // Socket port reuse flag on Linux Linux端口复用标识(地址+端口)
-#define CERT_FILE "/mnt/c/Users/22126/CLionProjects/MLkem/cmake-build-debug-wsl/server.crt"  // TLS certificate path on WSL WSL环境TLS证书路径
-#define KEY_FILE  "/mnt/c/Users/22126/CLionProjects/MLkem/cmake-build-debug-wsl/server.key"   // TLS private key path on WSL WSL环境TLS私钥路径
+#define CERT_FILE "./cert/cert.pem" // TLS certificate path on WSL WSL环境TLS证书路径
+#define KEY_FILE  "./cert/key.pem"   // TLS private key path on WSL WSL环境TLS私钥路径
 #endif
 
 /**
