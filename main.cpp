@@ -1,349 +1,324 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <oqs/kem.h>
-#include <openssl/aes.h>
-#include <openssl/evp.h>
+#include <iostream>
+#include <string>
+#include <cstring>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/crypto.h>
+#include <oqs/oqs.h>
 
-// 选择 ML-KEM 算法（可选：ml_kem_512/ml_kem_768/ml_kem_1024）
-#define ML_KEM_ALG OQS_KEM_alg_ml_kem_768
-// AES-GCM 密钥长度（ML-KEM 输出的会话密钥为 32 字节，适配 AES-256）
-#define AES_KEY_LEN 32
-// AES-GCM 随机数（IV）长度
-#define AES_IV_LEN 12
-// AES-GCM 标签长度（认证用）
-#define AES_TAG_LEN 16
+using namespace std;
 
-/**
- * @brief ML-KEM 加密函数（明文 -> 密文 + 会话密钥）
- * @param plaintext 输入：明文数据
- * @param plaintext_len 输入：明文长度（字节）
- * @param pk 输入：ML-KEM 公钥（由密钥对生成函数产出）
- * @param ciphertext 输出：最终密文（格式：KEM密文 + AES IV + AES密文 + AES标签）
- * @param ciphertext_len 输出：最终密文总长度
- * @param ss 输出：ML-KEM 会话密钥（可选，NULL 则内部使用）
- * @return 0 成功，非 0 失败
- */
-int ml_kem_encrypt(const uint8_t *plaintext, size_t plaintext_len,
-                   const uint8_t *pk, uint8_t **ciphertext, size_t *ciphertext_len,
-                   uint8_t *ss) {
-    // 1. 初始化 OQS KEM 上下文
-    OQS_KEM *kem = OQS_KEM_new(ML_KEM_ALG);
-    if (kem == NULL) {
-        fprintf(stderr, "Failed to create KEM context\n");
-        return -1;
-    }
+// ====================== ✅ 核心跨平台条件编译 - 完美适配 Linux/Windows 【完整版】 ======================
+#ifdef _WIN32
+// Windows系统 专属配置
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")  // Windows必须链接Socket库
+#define SOCKET_FD SOCKET
+#define CLOSE_SOCKET(fd) closesocket(fd)
+#define IS_INVALID_SOCKET(fd) (fd == INVALID_SOCKET)
+#define SOCKET_ERR_MSG() cout << "错误码：" << WSAGetLastError() << endl;
+// Windows send/recv 强转封装，解决uint8_t类型不匹配
+#define SEND_DATA(fd, buf, len) send(fd, (const char*)(buf), len, 0)
+#define RECV_DATA(fd, buf, len) recv(fd, (char*)(buf), len, 0)
+// Windows无SO_REUSEPORT，仅支持SO_REUSEADDR
+#define SOCKET_REUSE_FLAG SO_REUSEADDR
+#else
+// Linux/WSL系统 专属配置
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#define SOCKET_FD int
+#define CLOSE_SOCKET(fd) close(fd)
+#define IS_INVALID_SOCKET(fd) (fd == -1)
+#define SOCKET_ERR_MSG() perror("");
+// Linux原生支持uint8_t指针，无需强转
+#define SEND_DATA(fd, buf, len) send(fd, buf, len, 0)
+#define RECV_DATA(fd, buf, len) recv(fd, buf, len, 0)
+// Linux双复用：地址+端口
+#define SOCKET_REUSE_FLAG (SO_REUSEADDR | SO_REUSEPORT)
+#endif
+// ====================== ✅ 跨平台适配 END ======================
 
-    // 2. 分配内存：KEM 密文缓冲区（修复：ciphertext_length → length_ciphertext + C++ 强制类型转换）
-    uint8_t *kem_ct = (uint8_t*)malloc(kem->length_ciphertext);
-    if (kem_ct == NULL) {
-        OQS_KEM_free(kem);
-        fprintf(stderr, "Failed to malloc kem_ct\n");
-        return -2;
-    }
+// 全局常量：ML-KEM768 算法标识
+const char* MLKEM_ALG = OQS_KEM_alg_ml_kem_768;
+const size_t PSK_LEN = 32;
 
-    // 3. 生成 ML-KEM 会话密钥和密文（封装）（修复：OQS_KEM_encapsulate → OQS_KEM_encaps）
-    uint8_t local_ss[AES_KEY_LEN] = {0};
-    if (OQS_KEM_encaps(kem, kem_ct, (ss == NULL) ? local_ss : ss, pk) != OQS_SUCCESS) {
-        free(kem_ct);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "KEM encapsulate failed\n");
-        return -3;
-    }
-    const uint8_t *use_ss = (ss == NULL) ? local_ss : ss;
-
-    // 4. AES-GCM 加密明文（使用 KEM 会话密钥）
-    uint8_t iv[AES_IV_LEN];
-    uint8_t tag[AES_TAG_LEN];
-    // 修复：C++ 中 malloc 返回 void* 需强制转换为 uint8_t*
-    uint8_t *aes_ct = (uint8_t*)malloc(plaintext_len); // AES 密文长度 = 明文长度（GCM 无膨胀）
-    if (aes_ct == NULL) {
-        free(kem_ct);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "Failed to malloc aes_ct\n");
-        return -4;
-    }
-
-    // 生成随机 IV
-    OQS_randombytes(iv, AES_IV_LEN);
-
-    // 初始化 AES-GCM 上下文
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (ctx == NULL) {
-        free(kem_ct);
-        free(aes_ct);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "Failed to create EVP context\n");
-        return -5;
-    }
-
-    // 初始化加密操作
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, use_ss, iv) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        free(kem_ct);
-        free(aes_ct);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "EVP EncryptInit failed\n");
-        return -6;
-    }
-
-    // 执行 AES-GCM 加密
-    int aes_ct_len = 0;
-    if (EVP_EncryptUpdate(ctx, aes_ct, &aes_ct_len, plaintext, plaintext_len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        free(kem_ct);
-        free(aes_ct);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "EVP EncryptUpdate failed\n");
-        return -7;
-    }
-
-    // 生成认证标签
-    int tag_len = AES_TAG_LEN;
-    if (EVP_EncryptFinal_ex(ctx, aes_ct + aes_ct_len, &tag_len) != 1 || EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, AES_TAG_LEN, tag) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        free(kem_ct);
-        free(aes_ct);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "EVP EncryptFinal failed\n");
-        return -8;
-    }
-    EVP_CIPHER_CTX_free(ctx);
-
-    // 5. 拼接最终密文：KEM密文 + IV + AES密文 + 标签（修复：ciphertext_length → length_ciphertext）
-    *ciphertext_len = kem->length_ciphertext + AES_IV_LEN + plaintext_len + AES_TAG_LEN;
-    // 修复：C++ 中 malloc 返回 void* 需强制转换
-    *ciphertext = (uint8_t*)malloc(*ciphertext_len);
-    if (*ciphertext == NULL) {
-        free(kem_ct);
-        free(aes_ct);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "Failed to malloc final ciphertext\n");
-        return -9;
-    }
-
-    size_t offset = 0;
-    memcpy(*ciphertext + offset, kem_ct, kem->length_ciphertext);
-    offset += kem->length_ciphertext;
-    memcpy(*ciphertext + offset, iv, AES_IV_LEN);
-    offset += AES_IV_LEN;
-    memcpy(*ciphertext + offset, aes_ct, plaintext_len);
-    offset += plaintext_len;
-    memcpy(*ciphertext + offset, tag, AES_TAG_LEN);
-
-    // 6. 清理临时内存
-    free(kem_ct);
-    free(aes_ct);
-    OQS_KEM_free(kem);
-
-    return 0;
-}
-
-/**
- * @brief ML-KEM 解密函数（密文 + 私钥 -> 明文）
- * @param ciphertext 输入：加密函数产出的最终密文
- * @param ciphertext_len 输入：最终密文长度
- * @param sk 输入：ML-KEM 私钥（由密钥对生成函数产出）
- * @param plaintext 输出：解密后的明文
- * @param plaintext_len 输出：明文长度
- * @return 0 成功，非 0 失败
- */
-int ml_kem_decrypt(const uint8_t *ciphertext, size_t ciphertext_len,
-                   const uint8_t *sk, uint8_t **plaintext, size_t *plaintext_len) {
-    // 1. 初始化 OQS KEM 上下文
-    OQS_KEM *kem = OQS_KEM_new(ML_KEM_ALG);
-    if (kem == NULL) {
-        fprintf(stderr, "Failed to create KEM context\n");
-        return -1;
-    }
-
-    // 2. 校验密文长度合法性（修复：ciphertext_length → length_ciphertext）
-    size_t min_ciphertext_len = kem->length_ciphertext + AES_IV_LEN + AES_TAG_LEN;
-    if (ciphertext_len < min_ciphertext_len) {
-        OQS_KEM_free(kem);
-        fprintf(stderr, "Invalid ciphertext length\n");
-        return -2;
-    }
-
-    // 3. 拆分密文：KEM密文 + IV + AES密文 + 标签（修复：ciphertext_length → length_ciphertext + 强制类型转换）
-    size_t offset = 0;
-    uint8_t *kem_ct = (uint8_t*)malloc(kem->length_ciphertext);
-    memcpy(kem_ct, ciphertext + offset, kem->length_ciphertext);
-    offset += kem->length_ciphertext;
-
-    uint8_t iv[AES_IV_LEN];
-    memcpy(iv, ciphertext + offset, AES_IV_LEN);
-    offset += AES_IV_LEN;
-
-    *plaintext_len = ciphertext_len - offset - AES_TAG_LEN; // 明文长度 = 剩余长度 - 标签长度
-    // 修复：C++ 中 malloc 返回 void* 需强制转换
-    uint8_t *aes_ct = (uint8_t*)malloc(*plaintext_len);
-    memcpy(aes_ct, ciphertext + offset, *plaintext_len);
-    offset += *plaintext_len;
-
-    uint8_t tag[AES_TAG_LEN];
-    memcpy(tag, ciphertext + offset, AES_TAG_LEN);
-
-    // 4. ML-KEM 解封装恢复会话密钥（修复：OQS_KEM_decapsulate → OQS_KEM_decaps）
-    uint8_t ss[AES_KEY_LEN] = {0};
-    if (OQS_KEM_decaps(kem, ss, kem_ct, sk) != OQS_SUCCESS) {
-        free(kem_ct);
-        free(aes_ct);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "KEM decapsulate failed\n");
-        return -3;
-    }
-
-    // 5. AES-GCM 解密（验证标签 + 恢复明文）
-    // 修复：C++ 中 malloc 返回 void* 需强制转换
-    *plaintext = (uint8_t*)malloc(*plaintext_len);
-    if (*plaintext == NULL) {
-        free(kem_ct);
-        free(aes_ct);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "Failed to malloc plaintext\n");
-        return -4;
-    }
-
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (ctx == NULL) {
-        free(kem_ct);
-        free(aes_ct);
-        free(*plaintext);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "Failed to create EVP context\n");
-        return -5;
-    }
-
-    // 初始化解密操作
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, ss, iv) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        free(kem_ct);
-        free(aes_ct);
-        free(*plaintext);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "EVP DecryptInit failed\n");
-        return -6;
-    }
-
-    // 执行 AES-GCM 解密
-    int plaintext_tmp_len = 0;
-    if (EVP_DecryptUpdate(ctx, *plaintext, &plaintext_tmp_len, aes_ct, *plaintext_len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        free(kem_ct);
-        free(aes_ct);
-        free(*plaintext);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "EVP DecryptUpdate failed\n");
-        return -7;
-    }
-
-    // 设置并验证标签（防篡改）
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, AES_TAG_LEN, tag) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        free(kem_ct);
-        free(aes_ct);
-        free(*plaintext);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "EVP set tag failed\n");
-        return -8;
-    }
-
-    int final_len = 0;
-    if (EVP_DecryptFinal_ex(ctx, *plaintext + plaintext_tmp_len, &final_len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        free(kem_ct);
-        free(aes_ct);
-        free(*plaintext);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "EVP DecryptFinal failed (tag verify failed)\n");
-        return -9;
-    }
-    *plaintext_len = plaintext_tmp_len + final_len;
-    EVP_CIPHER_CTX_free(ctx);
-
-    // 6. 清理临时内存
-    free(kem_ct);
-    free(aes_ct);
-    OQS_KEM_free(kem);
-
-    return 0;
-}
-
-// 辅助函数：生成 ML-KEM 密钥对
-int ml_kem_keygen(uint8_t **pk, uint8_t **sk) {
-    OQS_KEM *kem = OQS_KEM_new(ML_KEM_ALG);
-    if (kem == NULL) {
-        fprintf(stderr, "Failed to create KEM context\n");
-        return -1;
-    }
-
-    // 修复：public_key_length → length_public_key / secret_key_length → length_secret_key + 强制类型转换
-    *pk = (uint8_t*)malloc(kem->length_public_key);
-    *sk = (uint8_t*)malloc(kem->length_secret_key);
-    if (*pk == NULL || *sk == NULL) {
-        free(*pk);
-        free(*sk);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "Failed to malloc key pair\n");
-        return -2;
-    }
-
-    if (OQS_KEM_keypair(kem, *pk, *sk) != OQS_SUCCESS) {
-        free(*pk);
-        free(*sk);
-        OQS_KEM_free(kem);
-        fprintf(stderr, "KEM keypair failed\n");
-        return -3;
-    }
-
-    OQS_KEM_free(kem);
-    return 0;
-}
-
-// 测试示例
-int main() {
-    // 1. 初始化 OQS（修复：OQS_init() 返回 void，无需判断返回值）
+// 初始化加密库 (跨平台通用，无需修改)
+void initCryptoLib() {
     OQS_init();
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+    ERR_load_crypto_strings();
+}
 
-    // 2. 生成 ML-KEM 密钥对
-    uint8_t *pk = NULL, *sk = NULL;
-    if (ml_kem_keygen(&pk, &sk) != 0) {
-        return -1;
+// 清理加密库 (跨平台通用，无需修改)
+void cleanupCryptoLib() {
+    EVP_cleanup();
+    ERR_free_strings();
+    CRYPTO_cleanup_all_ex_data();
+}
+
+// ====================== ✅ TLS 服务器类 (【全平台修复】支持Linux+Windows编译运行，循环接收连接) ======================
+class TLSServer {
+private:
+    SOCKET_FD server_fd;  // ✅ 修复：统一用跨平台SOCKET_FD类型
+    SSL_CTX* ctx;
+    const int port;
+    const string cert_path;
+    const string key_path;
+
+public:
+    TLSServer(int port_, const string& cert_, const string& key_)
+        : port(port_), cert_path(cert_), key_path(key_) {
+        initCryptoLib();
+
+        // ====================== ✅ 修复：Windows服务器也需要初始化Winsock ======================
+#ifdef _WIN32
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            cerr << "[服务器] Windows Socket初始化失败！"; SOCKET_ERR_MSG();
+            exit(-1);
+        }
+#endif
+
+        ctx = SSL_CTX_new(TLS_server_method());
+        if (!ctx) {
+            cerr << "[服务器] 初始化SSL上下文失败：" << ERR_error_string(ERR_get_error(), nullptr) << endl;
+            exit(-1);
+        }
+
+        if (SSL_CTX_use_certificate_file(ctx, cert_path.c_str(), SSL_FILETYPE_PEM) <= 0) {
+            cerr << "[服务器] 加载证书失败：" << ERR_error_string(ERR_get_error(), nullptr) << endl;
+            exit(-1);
+        }
+        if (SSL_CTX_use_PrivateKey_file(ctx, key_path.c_str(), SSL_FILETYPE_PEM) <= 0) {
+            cerr << "[服务器] 加载私钥失败：" << ERR_error_string(ERR_get_error(), nullptr) << endl;
+            exit(-1);
+        }
+        if (!SSL_CTX_check_private_key(ctx)) {
+            cerr << "[服务器] 私钥与证书不匹配！" << endl;
+            exit(-1);
+        }
+
+        // ✅ 统一跨平台socket创建
+        server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (IS_INVALID_SOCKET(server_fd)) {
+            cerr << "[服务器] 创建 socket 失败！"; SOCKET_ERR_MSG();
+            exit(-1);
+        }
+
+        int opt = 1;
+        // ✅ 修复核心1：替换SO_REUSEPORT，用跨平台宏SOCKET_REUSE_FLAG，解决未声明报错
+        setsockopt(server_fd, SOL_SOCKET, SOCKET_REUSE_FLAG, (const char*)&opt, sizeof(opt));
+
+        sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(port);
+        if (bind(server_fd, (sockaddr*)&addr, sizeof(addr)) == -1) {
+            cerr << "[服务器] 绑定端口失败！"; SOCKET_ERR_MSG(); exit(-1);
+        }
+        if (listen(server_fd, 5) == -1) {
+            cerr << "[服务器] 监听失败！"; SOCKET_ERR_MSG(); exit(-1);
+        }
+
+        cout << "[服务器] ✅ 初始化完成 (ML-KEM768 + TLS1.3 后量子加密)" << endl;
+        cout << "[服务器] ✅ 监听端口 " << port << " 中...【循环接收无限次连接】" << endl;
     }
 
-    // 3. 待加密的明文
-    const char *msg = "你好，我的世界";
-    size_t msg_len = strlen(msg);
+    void run() {
+        sockaddr_in client_addr;
+        socklen_t client_addr_len = sizeof(client_addr);
+        while (true) {
+            SOCKET_FD client_fd = accept(server_fd, (sockaddr*)&client_addr, &client_addr_len);
+            if (IS_INVALID_SOCKET(client_fd)) {
+                cerr << "[服务器] 接收连接失败！"; SOCKET_ERR_MSG(); continue;
+            }
+            cout << "\n==================================================" << endl;
+            cout << "[服务器] ✅ 客户端 " << inet_ntoa(client_addr.sin_addr) << ":" << ntohs(client_addr.sin_port) << " 已连接" << endl;
 
-    // 4. 加密
-    uint8_t *ciphertext = NULL;
-    size_t ciphertext_len = 0;
-    uint8_t ss[AES_KEY_LEN] = {0}; // 会话密钥（可选保存）
-    if (ml_kem_encrypt((uint8_t *)msg, msg_len, pk, &ciphertext, &ciphertext_len, ss) != 0) {
-        free(pk);
-        free(sk);
+            OQS_KEM* kem = OQS_KEM_new(MLKEM_ALG);
+            // ✅ 修复核心2：所有close(fd)替换为跨平台宏CLOSE_SOCKET(fd)，解决未声明报错
+            if (kem == nullptr) { cerr << "[服务器] ML-KEM初始化失败"; CLOSE_SOCKET(client_fd); continue; }
+
+            uint8_t mlkem_pubkey[OQS_KEM_ml_kem_768_length_public_key] = {0};
+            uint8_t mlkem_seckey[OQS_KEM_ml_kem_768_length_secret_key] = {0};
+            uint8_t mlkem_ciphertext[OQS_KEM_ml_kem_768_length_ciphertext] = {0};
+            uint8_t server_shared_key[PSK_LEN] = {0};
+
+            OQS_KEM_keypair(kem, mlkem_pubkey, mlkem_seckey);
+            // ✅ 修复核心3：用SEND_DATA/RECV_DATA宏，解决uint8_t转char*类型不匹配报错
+            SEND_DATA(client_fd, mlkem_pubkey, OQS_KEM_ml_kem_768_length_public_key);
+            RECV_DATA(client_fd, mlkem_ciphertext, OQS_KEM_ml_kem_768_length_ciphertext);
+
+            OQS_STATUS kem_status = OQS_KEM_decaps(kem, server_shared_key, mlkem_ciphertext, mlkem_seckey);
+            if (kem_status != OQS_SUCCESS) {
+                cerr << "[服务器] ML-KEM协商失败";
+                OQS_KEM_free(kem);
+                CLOSE_SOCKET(client_fd);
+                continue;
+            }
+            cout << "[服务器] ✅ ML-KEM768 后量子密钥协商成功！" << endl;
+
+            SSL* ssl = SSL_new(ctx);
+            SSL_set_fd(ssl, client_fd);
+            if (SSL_accept(ssl) <= 0) {
+                cerr << "[服务器] TLS握手失败：" << ERR_error_string(ERR_get_error(), nullptr);
+                SSL_free(ssl);
+                OQS_KEM_free(kem);
+                CLOSE_SOCKET(client_fd);
+                continue;
+            }
+            cout << "[服务器] ✅ TLS1.3 握手成功！协议版本：" << SSL_get_version(ssl) << endl;
+
+            char buf[1024] = {0};
+            int recv_len = SSL_read(ssl, buf, sizeof(buf)-1);
+            if (recv_len > 0) {
+                cout << "[服务器] ✅ 收到数据：" << buf << endl;
+                string reply = "服务器已收到：" + string(buf);
+                SSL_write(ssl, reply.c_str(), reply.size());
+                cout << "[服务器] ✅ 已回复加密数据" << endl;
+            }
+
+            // 所有资源释放都用跨平台宏
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            OQS_KEM_free(kem);
+            CLOSE_SOCKET(client_fd);
+            cout << "[服务器] ✅ 客户端连接已关闭，等待下一个连接..." << endl;
+        }
+    }
+
+    ~TLSServer() {
+        // ✅ 修复：服务器socket关闭也用跨平台宏
+        CLOSE_SOCKET(server_fd);
+        SSL_CTX_free(ctx);
+#ifdef _WIN32
+        WSACleanup(); // Windows收尾清理Winsock
+#endif
+        cleanupCryptoLib();
+    }
+};
+
+// ====================== ✅ TLS 客户端类 (无修改，之前已完美适配跨平台) ======================
+class TLSClient {
+private:
+    const string server_ip;
+    const int server_port;
+    SSL_CTX* ctx;
+    OQS_KEM* kem;
+
+public:
+    TLSClient(const string& ip_, int port_) : server_ip(ip_), server_port(port_) {
+        initCryptoLib();
+#ifdef _WIN32
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            cerr << "[客户端] Windows Socket初始化失败！"; SOCKET_ERR_MSG();
+            exit(-1);
+        }
+#endif
+
+        ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) { cerr << "[客户端] SSL初始化失败：" << ERR_error_string(ERR_get_error(), nullptr) << endl; exit(-1); }
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+
+        kem = OQS_KEM_new(MLKEM_ALG);
+        if (kem == nullptr) { cerr << "[客户端] ML-KEM初始化失败！" << endl; exit(-1); }
+
+        cout << "[客户端] ✅ 初始化完成 (ML-KEM768 + TLS1.3 后量子加密)" << endl;
+        cout << "[客户端] ✅ 准备连接服务器 " << server_ip << ":" << server_port << endl;
+    }
+
+    void connectAndHandshake() {
+        SOCKET_FD sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (IS_INVALID_SOCKET(sock_fd)) {
+            cerr << "[客户端] 创建Socket失败！"; SOCKET_ERR_MSG();
+            this->~TLSClient(); exit(-1);
+        }
+
+        sockaddr_in server_addr;
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(server_port);
+        if (inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr) <= 0) {
+            cerr << "[客户端] IP地址格式错误！" << endl; CLOSE_SOCKET(sock_fd); this->~TLSClient(); exit(-1);
+        }
+
+        if (connect(sock_fd, (sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+            cerr << "[客户端] 连接服务器失败！"; SOCKET_ERR_MSG();
+            CLOSE_SOCKET(sock_fd); this->~TLSClient(); exit(-1);
+        }
+        cout << "[客户端] ✅ 与服务器建立TCP连接成功" << endl;
+
+        uint8_t mlkem_pubkey[OQS_KEM_ml_kem_768_length_public_key] = {0};
+        uint8_t mlkem_ciphertext[OQS_KEM_ml_kem_768_length_ciphertext] = {0};
+        uint8_t client_shared_key[PSK_LEN] = {0};
+
+        RECV_DATA(sock_fd, mlkem_pubkey, OQS_KEM_ml_kem_768_length_public_key);
+        OQS_STATUS kem_status = OQS_KEM_encaps(kem, mlkem_ciphertext, client_shared_key, mlkem_pubkey);
+        if (kem_status != OQS_SUCCESS) { cerr << "[客户端] ML-KEM协商失败！" << endl; CLOSE_SOCKET(sock_fd); this->~TLSClient(); return; }
+        SEND_DATA(sock_fd, mlkem_ciphertext, OQS_KEM_ml_kem_768_length_ciphertext);
+        cout << "[客户端] ✅ ML-KEM768 后量子密钥协商成功！" << endl;
+
+        SSL* ssl = SSL_new(ctx);
+        SSL_set_fd(ssl, sock_fd);
+        SSL_set_tlsext_host_name(ssl, server_ip.c_str());
+        if (SSL_connect(ssl) <= 0) {
+            cerr << "[客户端] TLS握手失败：" << ERR_error_string(ERR_get_error(), nullptr) << endl;
+            SSL_free(ssl); CLOSE_SOCKET(sock_fd); this->~TLSClient(); return;
+        }
+        cout << "[客户端] ✅ TLS1.3 握手成功！协议版本：" << SSL_get_version(ssl) << endl;
+
+        string msg = "Hello! Cross-Platform ML-KEM+TLS Client!";
+        SSL_write(ssl, msg.c_str(), msg.size());
+        cout << "[客户端] ✅ 加密发送数据：" << msg << endl;
+
+        char buf[1024] = {0};
+        int recv_len = SSL_read(ssl, buf, sizeof(buf)-1);
+        if (recv_len > 0) cout << "[客户端] ✅ 收到服务器加密回复：" << buf << endl;
+
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        CLOSE_SOCKET(sock_fd);
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        cout << "[客户端] ✅ 连接已关闭，测试完成！" << endl;
+    }
+
+    ~TLSClient() {
+        SSL_CTX_free(ctx);
+        OQS_KEM_free(kem);
+        cleanupCryptoLib();
+    }
+};
+
+// ====================== ✅ 主函数 (无修改，编译时指定模式即可) ======================
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        cerr << "用法：" << argv[0] << " [server|client]" << endl;
         return -1;
     }
-    printf("Encrypt success, ciphertext length: %zu\n", ciphertext_len);
+    string mode = argv[1];
+    const int PORT = 8888;
+    const string SERVER_IP = "127.0.0.1";
+    const string CERT_PATH = "server.crt";
+    const string KEY_PATH = "server.key";
 
-    // 5. 解密
-    uint8_t *decrypted = NULL;
-    size_t decrypted_len = 0;
-    if (ml_kem_decrypt(ciphertext, ciphertext_len, sk, &decrypted, &decrypted_len) != 0) {
-        free(pk);
-        free(sk);
-        free(ciphertext);
+    if (mode == "server") {
+        TLSServer server(PORT, CERT_PATH, KEY_PATH);
+        server.run();
+    } else if (mode == "client") {
+        TLSClient client(SERVER_IP, PORT);
+        client.connectAndHandshake();
+    } else {
+        cerr << "仅支持 server/client 模式！" << endl;
         return -1;
     }
-    printf("Decrypt success, plaintext: %.*s\n", (int)decrypted_len, decrypted);
-
-    // 6. 清理内存（修复：OQS_cleanup() → OQS_destroy()）
-    free(pk);
-    free(sk);
-    free(ciphertext);
-    free(decrypted);
-    OQS_destroy();
-
     return 0;
 }
