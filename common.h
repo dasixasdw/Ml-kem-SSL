@@ -55,6 +55,11 @@ constexpr size_t MAX_ALG_NAME_LEN = 64;     // Maximum length of KEM algorithm n
 constexpr int SERVER_PORT = 8888;           // The listening port number of the ML-KEM server | ML-KEM服务端监听端口号
 constexpr const char* SERVER_IP = "127.0.0.1";  // The bound IP address of the ML-KEM server, use local loopback address | ML-KEM服务端绑定的IP地址，使用本地回环地址
 
+// ========== 新增：消息通信相关全局常量（兼容原有架构） ==========
+constexpr size_t MAX_MSG_LENGTH = 1024;     // Maximum length of encrypted message, prevent buffer overflow | 加密消息最大长度，防止缓冲区溢出
+constexpr const char* EXIT_CMD = "quit";    // Exit command for terminating communication | 终止通信的退出指令
+constexpr const char* SERVER_REPLY_PREFIX = "[服务端回复] 已收到你的消息："; // Prefix of server reply message | 服务端回复消息前缀
+
 /**
  * @brief KEM algorithm information structure definition
  * 抗量子密钥封装机制(KEM)算法信息结构体定义
