@@ -203,15 +203,55 @@ void MultiAlgKemServer::startServer() {
         std::cout << "[TLS Info] Cipher Suite: " << SSL_get_cipher(ssl) << std::endl;
 
         // ======================================
-        // Phase 4: Encrypted data transmission - Based on TLS1.3 secure encrypted channel
-        // 阶段4：加密数据收发 - 基于TLS1.3安全加密通道完成业务通信
+        // Phase 4: Persistent encrypted data transmission - Extended to cyclic communication (核心修改)
+        // 阶段4：【持久化加密数据收发】- 扩展为循环通信，支持quit退出
         // ======================================
-        char recv_buf[1024] = {0};
-        int recv_len = SSL_read(ssl, recv_buf, sizeof(recv_buf)-1);
-        if (recv_len > 0) {
-            std::cout << "[Encrypted Receive] " << recv_buf << std::endl;
-            std::string reply = "[Server Encrypted Reply] Received message: " + std::string(recv_buf) + " | Post-quantum Algorithm: " + client_alg;
-            SSL_write(ssl, reply.c_str(), reply.size());
+        std::cout << "\n[Communication Start] Start persistent encrypted communication with client (input 'quit' to exit)..." << std::endl;
+        char recv_buf[MAX_MSG_LENGTH] = {0};  // 替换为全局宏定义的消息长度
+        bool is_communication_running = true;
+
+        while (is_communication_running) {
+            // 清空接收缓冲区
+            memset(recv_buf, 0, sizeof(recv_buf));
+            // 读取客户端加密消息
+            int recv_len = SSL_read(ssl, recv_buf, sizeof(recv_buf)-1);
+
+            // 处理读取异常
+            if (recv_len <= 0) {
+                int ssl_err = SSL_get_error(ssl, recv_len);
+                if (ssl_err == SSL_ERROR_ZERO_RETURN) {
+                    std::cout << "[Communication Info] Client actively closed the encrypted connection" << std::endl;
+                } else {
+                    std::cerr << "[Communication Error] Failed to receive encrypted message: " << ERR_error_string(ERR_get_error(), nullptr) << std::endl;
+                }
+                is_communication_running = false;
+                continue;
+            }
+
+            // 解析客户端消息
+            std::string client_msg(recv_buf);
+            std::cout << "[Encrypted Receive] Client message: " << client_msg << std::endl;
+
+            // 处理退出指令
+            if (client_msg == EXIT_CMD) {
+                std::cout << "[Communication Info] Received exit command, terminating encrypted communication..." << std::endl;
+                std::string exit_reply = "[Server Encrypted Reply] Confirm exit, post-quantum encrypted communication ended!";
+                SSL_write(ssl, exit_reply.c_str(), exit_reply.size());
+                is_communication_running = false;
+                continue;
+            }
+
+            // 构造带算法信息的加密回复
+            std::string reply = SERVER_REPLY_PREFIX + client_msg + " | Post-quantum Algorithm: " + client_alg;
+            int send_len = SSL_write(ssl, reply.c_str(), reply.size());
+
+            // 处理发送异常
+            if (send_len <= 0) {
+                std::cerr << "[Communication Error] Failed to send encrypted reply: " << ERR_error_string(ERR_get_error(), nullptr) << std::endl;
+                is_communication_running = false;
+                continue;
+            }
+            std::cout << "[Encrypted Send] Reply sent to client: " << reply << std::endl;
         }
 
         // ======================================

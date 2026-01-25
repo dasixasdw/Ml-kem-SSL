@@ -186,19 +186,66 @@ void SwitchableKemClient::connectAndCommunicate() {
     std::cout << "[TLS Info] Protocol Version: " << SSL_get_version(ssl) << std::endl;
     std::cout << "[TLS Info] Cipher Suite: " << SSL_get_cipher(ssl) << std::endl;
 
-    // Send encrypted message via TLS channel | 通过TLS加密通道发送业务消息
-    std::string send_msg = "Hello Multi-algorithm Post-quantum Server! Client Algorithm: " + m_alg_name + " | TLS1.3 Encrypted Communication";
-    SSL_write(ssl, send_msg.c_str(), send_msg.size());
-    std::cout << "[Encrypted Send] " << send_msg << std::endl;
+    // ======================================
+    // Phase 5: Persistent interactive encrypted communication (核心修改)
+    // 阶段5：【持久化交互式加密通信】- 扩展为循环输入，支持quit退出
+    // ======================================
+    std::cout << "\n[Communication Start] Enter message to send (input '" << EXIT_CMD << "' to exit)..." << std::endl;
+    char recv_buf[MAX_MSG_LENGTH] = {0};  // 替换为全局宏定义的消息长度
+    std::string input_msg;
+    bool is_communication_running = true;
 
-    // Receive encrypted response message from server | 接收服务器的加密响应消息
-    char recv_buf[1024] = {0};
-    int recv_len = SSL_read(ssl, recv_buf, sizeof(recv_buf)-1);
-    if (recv_len > 0) {
-        std::cout << "[Encrypted Receive] " << recv_buf << std::endl;
+    while (is_communication_running) {
+        // 1. 读取用户输入
+        std::cout << "[Client Input] > ";
+        std::getline(std::cin, input_msg);
+
+        // 2. 发送加密消息到服务端
+        int send_len = SSL_write(ssl, input_msg.c_str(), input_msg.length());
+        if (send_len <= 0) {
+            std::cerr << "[Communication Error] Failed to send encrypted message: " << ERR_error_string(ERR_get_error(), nullptr) << std::endl;
+            is_communication_running = false;
+            continue;
+        }
+        std::cout << "[Encrypted Send] Message sent: " << input_msg << std::endl;
+
+        // 3. 处理退出指令
+        if (input_msg == EXIT_CMD) {
+            std::cout << "[Communication Info] Sending exit command to server..." << std::endl;
+            // 接收服务端退出确认
+            memset(recv_buf, 0, sizeof(recv_buf));
+            int recv_len = SSL_read(ssl, recv_buf, sizeof(recv_buf)-1);
+            if (recv_len > 0) {
+                std::cout << "[Encrypted Receive] Server reply: " << recv_buf << std::endl;
+            }
+            is_communication_running = false;
+            continue;
+        }
+
+        // 4. 接收服务端加密回复
+        memset(recv_buf, 0, sizeof(recv_buf));
+        int recv_len = SSL_read(ssl, recv_buf, sizeof(recv_buf)-1);
+
+        // 处理接收异常
+        if (recv_len <= 0) {
+            int ssl_err = SSL_get_error(ssl, recv_len);
+            if (ssl_err == SSL_ERROR_ZERO_RETURN) {
+                std::cout << "[Communication Info] Server closed the encrypted connection" << std::endl;
+            } else {
+                std::cerr << "[Communication Error] Failed to receive encrypted reply: " << ERR_error_string(ERR_get_error(), nullptr) << std::endl;
+            }
+            is_communication_running = false;
+            continue;
+        }
+
+        // 5. 显示服务端回复
+        std::cout << "[Encrypted Receive] Server reply: " << recv_buf << std::endl;
     }
 
-    // Release all resources in order, prevent memory leak | 按规范顺序释放所有资源，杜绝内存泄漏
+    // ======================================
+    // Resource release: keep original logic, release in reverse order
+    // 资源释放：保留原有逻辑，按逆序释放，零内存泄漏
+    // ======================================
     SSL_shutdown(ssl);
     SSL_free(ssl);
     delete[] pk;

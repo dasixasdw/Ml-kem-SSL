@@ -8,7 +8,7 @@
 # @date 2026/01/20
 #
 cmake_minimum_required(VERSION 3.21)
-project(MLkem)
+project(cmake-build-debug-wsl/MLkem)
 
 # Set global C++ standard: force C++20 standard, disable extended grammar, compatible with all compilers | 设置全局C++标准：强制C++20标准，关闭扩展语法，全编译器通用
 set(CMAKE_CXX_STANDARD 20)
