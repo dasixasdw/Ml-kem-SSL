@@ -81,7 +81,7 @@ MLkem.exe client
 # Windows 示例（三种算法任选）
 MLkem.exe client ML-KEM-1024
 
-# CLion：运行配置添加参数「client ML-KEM-512」
+# 连接成功后提示可与服务器进行沟通输入quit退出
 ```
 启动成功日志：`[客户端] 连接服务端成功！[客户端] ML-KEM算法协商完成，建立抗量子加密通信！`
 
