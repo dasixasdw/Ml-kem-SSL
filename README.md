@@ -5,7 +5,7 @@ OpenSSL 3.0+（含3.6.0）对证书安全等级有严格限制，需生成4096�
 ### 1. WSL/Linux 环境（推荐，适配性最佳）
 ```bash
 # 进入项目根目录
-cd /mnt/c/Users/22126/CLionProjects/MLkem
+cd /MLkem
 # 一键删除旧证书、生成新证书（有效期10年，无交互）
 rm -rf cert && mkdir -p cert && openssl req -x509 -nodes -days 3650 -newkey rsa:4096 -keyout cert/key.pem -out cert/cert.pem -subj "/CN=127.0.0.1"
 # 赋予证书可读权限，解决Linux权限问题
@@ -103,4 +103,5 @@ MLkem.exe client ML-KEM-1024
 1.  报错`ee key too small`：重新执行“前置准备”步骤，确保生成4096位证书，且已覆盖至编译目录；
 2.  报错`证书加载失败: No such file or directory`：进入编译目录，执行`cp -f ../cert/* cert/`手动拷贝证书；
 3.  Windows运行闪退（缺失DLL）：使用CLion编译，自动拷贝依赖库；或手动将vcpkg安装目录下的`libcrypto.dll`、`libssl.dll`、`liboqs.dll`拷贝至可执行文件同级目录；
+
 4.  WSL权限报错`Permission denied`：执行`chmod +x MLkem`赋予程序运行权限，再执行`chmod -R 755 cert`修复证书权限。 
