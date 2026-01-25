@@ -66,6 +66,7 @@ crypto_utils.cpp
 socket_utils.cpp
 kem_server.cpp
 kem_client.cpp
+        server_main.cpp
 )
 
 # Generate executable file: bind all source files to build target MLkem | 生成可执行文件：绑定所有源文件至编译目标MLkem
